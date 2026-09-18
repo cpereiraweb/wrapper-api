@@ -1,7 +1,9 @@
 name: Publicar imagem
 
 # Builda e publica a imagem no GHCR a cada push em main, taggeada com o SHA.
-# NÃO implanta nada: quem promove para :vX.Y.Z é o workflow de release.
+# Depois do teste de fumaça, o MESMO digest vira :latest e, se o secret
+# KRONN_DEPLOY_HOOK existir, a Kronn é chamada para reimplantar. Sem o secret,
+# publica e para aí. Quem promove para :vX.Y.Z continua sendo o release.
 on:
   push:
     branches: [main]
@@ -10,6 +12,13 @@ on:
 permissions:
   contents: read
   packages: write
+
+# Dois pushes seguidos na main não podem promover fora de ordem: sem isto, o
+# build mais lento terminaria depois e levaria :latest de volta para o commit
+# anterior, e com ele a produção.
+concurrency:
+  group: publicar-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   IMAGEM: ghcr.io/${{ github.repository }}/api
@@ -37,9 +46,11 @@ jobs:
           context: .
           platforms: linux/amd64 # a ACBrLib só existe para x86_64
           push: true
+          # Só o :sha aqui. O :latest anda depois da fumaça: publicá-lo junto,
+          # antes do teste, deixaria uma imagem que não sobe à disposição de
+          # qualquer redeploy que puxe :latest.
           tags: |
             ${{ env.IMAGEM }}:${{ github.sha }}
-            ${{ env.IMAGEM }}:latest
           build-args: |
             APP_COMMIT=${{ github.sha }}
             APP_BUILD=${{ github.event.repository.updated_at }}
@@ -86,3 +97,44 @@ jobs:
           docker logs fumaca-worker 2>&1 | grep -c '"backend":"cgo"' | grep -q '^5$' \
             || { echo "::error::a lib nativa não carregou nos 5 serviços"; docker logs fumaca-worker; exit 1; }
           echo "fumaça OK"
+
+      # imagetools copia o manifesto: :latest aponta para o digest que acabou de
+      # passar pela fumaça, sem rebuild, como o release faz com :vX.Y.Z.
+      - name: promove :<sha> → :latest
+        run: |
+          set -eu
+          docker buildx imagetools create -t "${IMAGEM}:latest" "${IMAGEM}:${GITHUB_SHA}"
+          docker buildx imagetools inspect "${IMAGEM}:latest"
+
+      # O deploy hook da Kronn é uma URL cujo UUID é a própria autenticação: vive
+      # só no secret, nunca no repositório. Sem ele, este passo não faz nada.
+      - name: implanta na Kronn
+        env:
+          KRONN_DEPLOY_HOOK: ${{ secrets.KRONN_DEPLOY_HOOK }}
+        run: |
+          set -eu
+          if [ -z "${KRONN_DEPLOY_HOOK:-}" ]; then
+            echo "::notice::KRONN_DEPLOY_HOOK não configurado: imagem publicada, nada implantado."
+            exit 0
+          fi
+          # Só 202 é sucesso. A Kronn responde 200 quando o auto-deploy está
+          # desligado no painel, e isso não pode passar por implantado. 409 é
+          # outro deploy em curso: esperar e repetir, senão este commit fica fora
+          # da produção sem ninguém saber.
+          for tentativa in $(seq 1 10); do
+            codigo=$(curl -sS --max-time 30 -o /tmp/kronn.json -w '%{http_code}' \
+                       -X POST "$KRONN_DEPLOY_HOOK" || echo 000)
+            case "$codigo" in
+              202)
+                echo "deploy enfileirado na Kronn"; cat /tmp/kronn.json; echo
+                exit 0 ;;
+              409)
+                echo "deploy anterior ainda em curso (tentativa $tentativa de 10); de novo em 30s"
+                sleep 30 ;;
+              *)
+                echo "::error::a Kronn respondeu HTTP $codigo"; cat /tmp/kronn.json 2>/dev/null || true
+                exit 1 ;;
+            esac
+          done
+          echo "::error::a Kronn seguiu ocupada por 5 minutos; reimplante pelo painel"
+          exit 1

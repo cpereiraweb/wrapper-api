@@ -1,0 +1,12 @@
+{
+    "mcpServers": {
+        "hubdev": {
+            "type": "stdio",
+            "command": "hubdev",
+            "args": [
+                "mcp"
+            ],
+            "env": {}
+        }
+    }
+}

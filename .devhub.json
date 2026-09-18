@@ -1,0 +1,5 @@
+{
+  "php": "8.5",
+  "domain": "wrapper-api.test",
+  "database": "wrapper_api"
+}

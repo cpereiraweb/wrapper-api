@@ -134,5 +134,35 @@ func escutar(socket string) (net.Listener, error) {
 		_ = lis.Close()
 		return nil, err
 	}
-	return lis, nil
+	meu, err := os.Stat(socket)
+	if err != nil {
+		_ = lis.Close()
+		return nil, err
+	}
+	// Quem apaga o caminho ao sair é o soquete, e só se ele ainda for nosso.
+	lis.(*net.UnixListener).SetUnlinkOnClose(false)
+	return &soquete{Listener: lis, caminho: socket, meu: meu}, nil
+}
+
+// soquete é o listener do worker, que ao fechar só apaga o caminho se o arquivo
+// ainda for o que este processo criou.
+//
+// O net.UnixListener apaga o caminho no Close sem olhar de quem ele é. Num
+// rolling update start-first, que é o que o Swarm faz com serviço que tem
+// healthcheck, o worker novo sobe, remove o caminho e escuta no lugar, e só
+// depois o antigo recebe SIGTERM. Com o comportamento padrão, o antigo levava
+// junto o socket do sucessor: o novo seguia vivo escutando num arquivo que não
+// existia mais, e a API respondia 503 até alguém reiniciar o worker.
+type soquete struct {
+	net.Listener
+	caminho string
+	meu     os.FileInfo
+}
+
+func (s *soquete) Close() error {
+	err := s.Listener.Close()
+	if atual, errStat := os.Stat(s.caminho); errStat == nil && os.SameFile(s.meu, atual) {
+		_ = os.Remove(s.caminho)
+	}
+	return err
 }

@@ -1,0 +1,103 @@
+# wrapper-api na Kronn: stack de produção (Swarm ou Compose).
+#
+# Cole no painel da Kronn como compose de uma app em modo IMAGEM, criada com o
+# nome "wrapper-api", porta interna 8080. O passo a passo está em
+# deploy/kronn/README.md. A Kronn regrava este arquivo a cada deploy e só
+# preserva este cabeçalho, então o porquê de cada escolha fica aqui em cima:
+#
+# - A chave do primeiro serviço é o slug da app (wrapper-api). É nele que a
+#   Kronn põe o domínio, o HTTPS e o expose, e é por esse nome que ela acha
+#   logs, terminal e escala. Com outro nome de app, troque a chave e o
+#   container_name.
+# - São dois serviços da mesma imagem. O worker carrega a lib fiscal nativa, que
+#   pode morrer com SIGSEGV; isolado, leva só a requisição em curso. A API fala
+#   com ele por um socket unix no volume worker-run.
+# - Os dois rodam no MESMO nó (node.role == manager): volume nomeado é local ao
+#   nó, e em nós diferentes a API nunca veria o socket.
+# - O worker tem UMA réplica, sempre. Várias escutariam o mesmo caminho e só a
+#   última atenderia. Mais vazão é ACBR_WORKER_SLOTS no .env.
+# - stop_grace_period de 75s nos dois: o shutdown espera até 60s por uma
+#   transmissão em curso. Cortar antes deixa documento em desfecho indeterminado.
+# - restart_policy "any": o worker sai com código 0 quando recicla
+#   (ACBR_WORKER_MAX_CALLS), e "on-failure" não o traria de volta.
+# - Healthcheck explícito nos dois. O da imagem testa a porta 8080, que o worker
+#   não abre. O do worker só passa quando o socket foi criado no próprio
+#   container (/proc/net/unix é por namespace de rede): durante o start-first o
+#   caminho ainda aponta para o worker antigo, e o curl sozinho aprovaria o novo
+#   antes de ele escutar.
+# - container_name só vale fora do Swarm. Sem ele, a Kronn remove os containers
+#   pelo nome do serviço, e "worker" pegaria qualquer container com esse nome.
+# - Variáveis vêm do .env do painel, lido pelos dois serviços. Nenhum segredo
+#   neste arquivo.
+services:
+  wrapper-api:
+    image: ghcr.io/cpereiraweb/wrapper-api/api:latest
+    container_name: kronn-app-wrapper-api
+    env_file: .env
+    environment:
+      ACBR_WORKERS: /run/wrapper/fiscal.sock
+    volumes:
+      - worker-run:/run/wrapper
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    stop_grace_period: 75s
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: any
+        delay: 5s
+      update_config:
+        parallelism: 1
+        delay: 10s
+        monitor: 30s
+        failure_action: rollback
+        order: start-first
+      rollback_config:
+        parallelism: 1
+        delay: 5s
+
+  worker:
+    image: ghcr.io/cpereiraweb/wrapper-api/api:latest
+    container_name: kronn-app-wrapper-api-worker
+    command: ["worker"]
+    env_file: .env
+    environment:
+      ACBR_WORKER_LISTEN: /run/wrapper/fiscal.sock
+    volumes:
+      - worker-run:/run/wrapper
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q ' /run/wrapper/fiscal.sock$$' /proc/net/unix && curl -fsS --unix-socket /run/wrapper/fiscal.sock http://worker/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    stop_grace_period: 75s
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: any
+        delay: 5s
+      update_config:
+        parallelism: 1
+        delay: 10s
+        monitor: 30s
+        failure_action: rollback
+        order: start-first
+      rollback_config:
+        parallelism: 1
+        delay: 5s
+
+volumes:
+  worker-run:
