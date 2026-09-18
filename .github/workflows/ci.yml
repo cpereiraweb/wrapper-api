@@ -121,3 +121,24 @@ jobs:
             echo "::error::arquivos acima de 500 KB rastreados:"; echo "$grandes"; exit 1
           fi
           echo "nenhum binário grande rastreado"
+
+  # Publicação e deploy vêm depois de TODOS os gates acima, na mesma execução.
+  # Com o deploy a cada push na main, publicar em paralelo com o CI mandaria
+  # para a produção um commit reprovado: na primeira execução, o job cgo ficou
+  # vermelho enquanto a imagem era promovida a :latest.
+  publicar:
+    name: publica a imagem e implanta
+    needs: [test, cgo, govulncheck, lint, segredo]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    # Dois pushes seguidos na main não podem promover fora de ordem: sem isto, o
+    # build mais lento terminaria depois e levaria :latest de volta para o
+    # commit anterior, e com ele a produção.
+    concurrency:
+      group: publicar-${{ github.ref }}
+      cancel-in-progress: false
+    uses: ./.github/workflows/publicar.yml
+    secrets:
+      KRONN_DEPLOY_HOOK: ${{ secrets.KRONN_DEPLOY_HOOK }}

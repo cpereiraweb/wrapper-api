@@ -1,24 +1,23 @@
 name: Publicar imagem
 
-# Builda e publica a imagem no GHCR a cada push em main, taggeada com o SHA.
-# Depois do teste de fumaça, o MESMO digest vira :latest e, se o secret
-# KRONN_DEPLOY_HOOK existir, a Kronn é chamada para reimplantar. Sem o secret,
-# publica e para aí. Quem promove para :vX.Y.Z continua sendo o release.
+# Builda e publica a imagem no GHCR, taggeada com o SHA. Depois do teste de
+# fumaça, o MESMO digest vira :latest e, se o secret KRONN_DEPLOY_HOOK existir,
+# a Kronn é chamada para reimplantar. Sem o secret, publica e para aí. Quem
+# promove para :vX.Y.Z continua sendo o release.
+#
+# Não tem gatilho próprio: quem chama é o job "publicar" do ci.yml, em push na
+# main, e só depois de todos os gates passarem. Com gatilho de push próprio ele
+# rodava em paralelo com o CI, e um commit reprovado nos testes chegava à
+# produção do mesmo jeito. Para republicar, re-execute o CI daquele commit.
 on:
-  push:
-    branches: [main]
-  workflow_dispatch:
+  workflow_call:
+    secrets:
+      KRONN_DEPLOY_HOOK:
+        required: false
 
 permissions:
   contents: read
   packages: write
-
-# Dois pushes seguidos na main não podem promover fora de ordem: sem isto, o
-# build mais lento terminaria depois e levaria :latest de volta para o commit
-# anterior, e com ele a produção.
-concurrency:
-  group: publicar-${{ github.ref }}
-  cancel-in-progress: false
 
 env:
   IMAGEM: ghcr.io/${{ github.repository }}/api
