@@ -4,18 +4,27 @@ A imagem é construída pelo GitHub Actions a cada push na `main`, publicada no
 GHCR e implantada na Kronn pelo deploy hook. O caminho inteiro:
 
 ```
-push na main
-  └─ ci.yml         fmt, vet, testes, link cgo, govulncheck, lint
-  └─ publicar.yml   build → :<sha> → teste de fumaça → :latest → deploy hook
-                                                                  │
-Kronn  ◀─────────────────────────────────────────────────────────┘
+push na main → ci.yml, uma execução só, em sequência:
+  1. fmt, vet, testes, link cgo, govulncheck, lint, segredo   (em paralelo)
+  2. job publicar (publicar.yml), só se TODOS passarem:
+       build → :<sha> → teste de fumaça → :latest → deploy hook
+                                                        │
+Kronn (app nfe-api, Docker sem Swarm)  ◀──────────────┘
   docker pull ghcr.io/cpereiraweb/wrapper-api/api:latest
-  docker stack deploy -c docker-compose.yml kronn-app-wrapper-api
+  docker compose down --remove-orphans
+  docker compose up -d --force-recreate --remove-orphans
 ```
 
-O `:latest` só anda depois de o teste de fumaça provar que a imagem sobe e que a
-lib nativa carrega nos cinco serviços. Imagem que falhou ali nunca chega à
-Kronn, nem por um redeploy manual.
+Commit reprovado em qualquer gate não gera imagem. E o `:latest` só anda
+depois de o teste de fumaça provar que a imagem sobe e que a lib nativa carrega
+nos cinco serviços: imagem que falhou ali nunca chega à Kronn, nem por um
+redeploy manual. Para republicar um commit, re-execute o CI dele.
+
+Cada deploy derruba e sobe os dois containers: são alguns segundos sem serviço
+(o worker carrega a lib e só então a API sobe). Uma transmissão em curso não é
+cortada: o `stop_grace_period` de 75s cobre os 60s que o shutdown espera por
+ela. Quem chegar nessa janela recebe erro do Traefik, sem o corpo JSON de erro
+da API, e pode repetir: a requisição não chegou ao serviço.
 
 ## Uma vez, no GitHub
 
@@ -45,19 +54,22 @@ secret, nunca em arquivo, issue ou chat.
 
    | Campo | Valor |
    |---|---|
-   | Nome | `wrapper-api` (vira o slug, e o compose depende dele) |
+   | Nome | `nfe-api` (vira o slug, e o compose depende dele) |
    | Imagem | `ghcr.io/cpereiraweb/wrapper-api/api` |
    | Tag | `latest` |
    | Porta interna | `8080` (o default da Kronn é 80) |
-   | Domínio | o domínio público, com SSL ligado |
+   | Domínio | `nfe.datasapiens.ia.br`, com SSL ligado |
    | Health check | desligado: o compose já traz os dois |
+   | Volumes | nenhum: o compose declara o dele |
    | Autenticação | manual, com a credencial do passo 1 |
 
    Imagem e tag têm que ser idênticas ao `image:` do compose. A Kronn faz o
    `docker pull` pelo que está no painel e implanta pelo que está no compose,
    e não reescreve um a partir do outro.
-3. **Compose:** cole o [`docker-compose.yml`](docker-compose.yml) deste
-   diretório no editor.
+3. **Compose:** troque o que a Kronn gerou (só a API, sem worker nem volume)
+   pelo [`docker-compose.yml`](docker-compose.yml) deste diretório. Ele já traz
+   os labels do Traefik, então a Kronn o usa como está: se mudar o domínio no
+   painel, mude também a linha do `Host(...)` aqui.
 4. **`.env`:** cole o bloco abaixo e preencha o `API_TOKEN`. Ligue o
    **auto-deploy** e copie a URL do deploy hook para o secret do GitHub.
 5. **DNS:** aponte o domínio para o servidor. O Traefik da Kronn emite o
@@ -65,7 +77,7 @@ secret, nunca em arquivo, issue ou chat.
 6. **Primeiro deploy** pelo painel, e confira:
 
    ```bash
-   curl -fsS https://<domínio>/readyz     # {"status":"ok"}: o worker carregou a lib
+   curl -fsS https://nfe.datasapiens.ia.br/readyz   # {"status":"ok"}: o worker carregou a lib
    ```
 
 ### O `.env`
@@ -95,18 +107,16 @@ ACBR_WORKER_MAX_CALLS=0
 `ACBR_WORKERS` e `ACBR_WORKER_LISTEN` estão fixos no compose, e é lá que devem
 ficar: são o contrato entre os dois serviços, não configuração.
 
-O limite por endereço só enxerga o IP real do chamador se o Traefik publicar as
-portas 80/443 em `mode: host`. Em modo `ingress`, a malha do Swarm troca a
-origem por um endereço interno e todos os chamadores voltam a dividir um balde.
-Se o único cliente for o backend de um sistema, dimensione `API_RATE_PER_MIN`
-para ele.
+Se o único cliente for o backend de um sistema, todas as chamadas saem do mesmo
+endereço e dividem o mesmo balde: dimensione `API_RATE_PER_MIN` para ele.
 
 ## O que não fazer no painel
 
 - **Não use os editores de Volumes, Health check e Recursos desta app.** Eles
   reescrevem só o serviço principal e trocam o `volumes:` dele pelo do painel: a
   API perde o socket e fica em 503.
-- **Não aumente as réplicas do `worker`.** Todas escutariam o mesmo caminho.
+- **Não crie outro `worker` apontando para o mesmo socket.** Todos escutariam o
+  mesmo caminho e só o último atenderia. Mais vazão é `ACBR_WORKER_SLOTS`.
 - **Não use o rollback do painel.** Ele troca a tag no painel, mas o compose
   continua em `:latest`. Veja "Voltando uma versão" abaixo.
 
